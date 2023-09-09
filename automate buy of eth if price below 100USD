@@ -1,0 +1,113 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+import "@pancakeswap/pancake-swap-lib/contracts/interfaces/IPancakeRouter02.sol";
+import "@chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface";
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/utils/math/SafeMath.sol";
+import "@openzeppelin/contracts/proxy/upgradeable/Initializable.sol";
+
+contract AutoBuyETH is Initializable, Ownable {
+    using SafeMath for uint256;
+
+    IPancakeRouter02 public pancakeRouter;
+    AggregatorV3Interface public ethPriceFeed;
+    address public wethAddress;
+    address public usdAddress;
+
+    bool private isEmergencyStopped;
+    mapping(address => bool) public supportedTokens;
+
+    event ETHBought(uint256 ethAmount);
+    event EmergencyStopToggled(bool isStopped);
+    event TokenAddedForWithdrawal(address tokenAddress);
+    event TokenRemovedFromWithdrawal(address tokenAddress);
+
+    modifier onlyWhenNotStopped() {
+        require(!isEmergencyStopped, "Contract is stopped");
+        _;
+    }
+
+    modifier onlySupportedTokens(address tokenAddress) {
+        require(supportedTokens[tokenAddress], "Token not supported for withdrawal");
+        _;
+    }
+
+    function initialize(
+        address _pancakeRouter,
+        address _ethPriceFeed,
+        address _wethAddress,
+        address _usdAddress
+    ) public initializer {
+        __Ownable_init();
+        pancakeRouter = IPancakeRouter02(_pancakeRouter);
+        ethPriceFeed = AggregatorV3Interface(_ethPriceFeed);
+        wethAddress = _wethAddress;
+        usdAddress = _usdAddress;
+    }
+
+    function toggleEmergencyStop() external onlyOwner {
+        isEmergencyStopped = !isEmergencyStopped;
+        emit EmergencyStopToggled(isEmergencyStopped);
+    }
+
+    function checkContractBalance() private view returns (bool) {
+        return address(this).balance >= 1 ether;
+    }
+
+    function isEthPriceBelow100USD() private view returns (bool) {
+        (, int256 price, , , ) = ethPriceFeed.latestRoundData();
+        return price > 0 && uint256(price) < 100 * 1e8;
+    }
+
+    function buyETHIfPriceBelow100USD() external onlyOwner onlyWhenNotStopped {
+        require(checkContractBalance(), "Contract balance insufficient");
+        require(isEthPriceBelow100USD(), "ETH price is not below $100");
+
+        address[] memory path = new address[](2);
+        path[0] = usdAddress;
+        path[1] = wethAddress;
+
+        uint256[] memory amounts = pancakeRouter.swapExactTokensForTokens(
+            1 ether,
+            0,
+            path,
+            address(this),
+            block.timestamp + 600
+        );
+
+        require(amounts[1] >= 1 ether, "Swap failed");
+
+        emit ETHBought(1 ether);
+
+        // Transfer the purchased ETH to the contract owner
+        (bool success, ) = owner().call{value: 1 ether}("");
+        require(success, "Transfer to owner failed");
+    }
+
+    function withdrawETH() external onlyOwner {
+        uint256 balance = address(this).balance;
+        require(balance > 0, "No ETH to withdraw");
+        (bool success, ) = owner().call{value: balance}("");
+        require(success, "Withdrawal failed");
+    }
+
+    function addTokenForWithdrawal(address tokenAddress) external onlyOwner {
+        supportedTokens[tokenAddress] = true;
+        emit TokenAddedForWithdrawal(tokenAddress);
+    }
+
+    function removeTokenFromWithdrawal(address tokenAddress) external onlyOwner {
+        supportedTokens[tokenAddress] = false;
+        emit TokenRemovedFromWithdrawal(tokenAddress);
+    }
+
+    function withdrawToken(address tokenAddress, uint256 amount) external onlyOwner onlySupportedTokens(tokenAddress) {
+        IERC20 token = IERC20(tokenAddress);
+        uint256 balance = token.balanceOf(address(this));
+        require(balance >= amount, "Insufficient token balance");
+
+        require(token.transfer(owner(), amount), "Token transfer failed");
+    }
+}
